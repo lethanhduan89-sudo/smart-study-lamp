@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Đèn học thông minh AI</title>
+  <style>
+    body { font-family: Arial, sans-serif; max-width: 760px; margin: 32px auto; padding: 0 16px; }
+    h1 { margin-bottom: 8px; }
+    #chat { border: 1px solid #ddd; border-radius: 12px; padding: 16px; min-height: 280px; margin-bottom: 16px; }
+    .msg { margin: 10px 0; padding: 10px 12px; border-radius: 10px; max-width: 80%; }
+    .user { background: #e8f0fe; margin-left: auto; }
+    .ai { background: #eef7ee; }
+    .row { display: flex; gap: 8px; }
+    input { flex: 1; padding: 12px; font-size: 16px; }
+    button { padding: 12px 16px; font-size: 16px; cursor: pointer; }
+    #status { margin-top: 12px; color: #444; }
+  </style>
+</head>
+<body>
+  <h1>Đèn học thông minh AI</h1>
+  <div id="chat"></div>
+
+  <div class="row">
+    <input id="textInput" placeholder="Nhập: bật đèn, tăng sáng, chỉnh 70%..." />
+    <button onclick="sendText()">Gửi</button>
+  </div>
+
+  <div id="status">Đang tải trạng thái thiết bị...</div>
+
+  <script>
+    const BACKEND = "https://smart-lamp-backend.onrender.com";
+
+    function addMsg(text, role) {
+      const div = document.createElement("div");
+      div.className = "msg " + role;
+      div.textContent = text;
+      document.getElementById("chat").appendChild(div);
+      div.scrollIntoView({ behavior: "smooth", block: "end" });
+    }
+
+    function speak(text) {
+      if (!window.speechSynthesis) return;
+      const u = new SpeechSynthesisUtterance(text);
+      u.lang = "vi-VN";
+      speechSynthesis.speak(u);
+    }
+
+    async function sendText() {
+      const input = document.getElementById("textInput");
+      const text = input.value.trim();
+      if (!text) return;
+
+      addMsg("Bạn: " + text, "user");
+      input.value = "";
+
+      const res = await fetch(BACKEND + "/ask", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({ text })
+      });
+      const data = await res.json();
+
+      addMsg("AI: " + (data.reply || "Không có phản hồi"), "ai");
+      if (data.reply) speak(data.reply);
+      refreshStatus();
+    }
+
+    async function refreshStatus() {
+      try {
+        const res = await fetch(BACKEND + "/device/status");
+        const s = await res.json();
+        document.getElementById("status").textContent =
+          `Độ sáng: ${s.brightness}% | Auto: ${s.auto_mode ? "Bật" : "Tắt"} | Lux: ${s.ambient_lux ?? "-"} | Khoảng cách: ${s.distance_cm ?? "-"} cm`;
+      } catch (e) {
+        document.getElementById("status").textContent = "Không lấy được trạng thái thiết bị.";
+      }
+    }
+
+    refreshStatus();
+    setInterval(refreshStatus, 5000);
+  </script>
+</body>
+</html>
