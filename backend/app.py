@@ -1,16 +1,28 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, UploadFile, File
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from openai import OpenAI
 import os
 import json
+import uuid
+from pathlib import Path
 
 app = FastAPI()
 client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 
+BASE_URL = os.environ.get("PUBLIC_BASE_URL", "https://smart-study-lamp.onrender.com")
+AUDIO_DIR = Path("audio_cache")
+UPLOAD_DIR = Path("uploads")
+AUDIO_DIR.mkdir(exist_ok=True)
+UPLOAD_DIR.mkdir(exist_ok=True)
+
+app.mount("/audio_cache", StaticFiles(directory="audio_cache"), name="audio_cache")
+
 latest_command = {
     "command": None,
     "value": None,
-    "reply": None
+    "reply": None,
+    "audio_url": None,
 }
 
 device_status = {
@@ -18,7 +30,8 @@ device_status = {
     "auto_mode": True,
     "ambient_lux": None,
     "distance_cm": None,
-    "online": False
+    "mic_level": None,
+    "online": False,
 }
 
 class UserInput(BaseModel):
@@ -29,13 +42,23 @@ class DeviceReport(BaseModel):
     auto_mode: bool | None = None
     ambient_lux: float | None = None
     distance_cm: float | None = None
+    mic_level: float | None = None
 
-@app.get("/")
-def root():
-    return {"ok": True, "message": "backend running"}
+def make_tts_wav(text: str) -> str:
+    file_id = str(uuid.uuid4())
+    out_path = AUDIO_DIR / f"{file_id}.wav"
 
-@app.post("/ask")
-def ask_ai(data: UserInput):
+    with client.audio.speech.with_streaming_response.create(
+        model="gpt-4o-mini-tts",
+        voice="alloy",
+        input=text,
+        response_format="wav",
+    ) as response:
+        response.stream_to_file(out_path)
+
+    return f"{BASE_URL}/audio_cache/{file_id}.wav"
+
+def run_ai_from_text(user_text: str):
     global latest_command
 
     prompt = f"""
@@ -54,10 +77,10 @@ Các command hợp lệ:
 - none
 
 Quy tắc:
-- reply phải là tiếng Việt tự nhiên, ngắn gọn, thân thiện.
-- Nếu người dùng yêu cầu đặt độ sáng cụ thể, dùng set_brightness và value 0-100.
+- reply phải là tiếng Việt tự nhiên, thân thiện, ngắn gọn.
+- Nếu người dùng yêu cầu đặt độ sáng cụ thể, dùng set_brightness và value từ 0 đến 100.
 - Nếu không phải lệnh điều khiển, dùng command = none.
-- Nếu câu hỏi là hỏi trạng thái, dùng command = status.
+- Nếu người dùng hỏi trạng thái, dùng command = status.
 
 Trạng thái thiết bị hiện tại:
 {json.dumps(device_status, ensure_ascii=False)}
@@ -67,19 +90,19 @@ Trạng thái thiết bị hiện tại:
         model="gpt-4.1-mini",
         input=[
             {"role": "system", "content": prompt},
-            {"role": "user", "content": data.text}
-        ]
+            {"role": "user", "content": user_text},
+        ],
     )
 
     raw = response.output_text.strip()
 
     try:
-      parsed = json.loads(raw)
+        parsed = json.loads(raw)
     except Exception:
-      parsed = {
-          "reply": "Mình chưa hiểu rõ, bạn nói lại giúp mình nhé.",
-          "command": "none"
-      }
+        parsed = {
+            "reply": "Mình chưa hiểu rõ, bạn nói lại giúp mình nhé.",
+            "command": "none",
+        }
 
     if parsed.get("command") == "status":
         parsed["reply"] = (
@@ -87,19 +110,55 @@ Trạng thái thiết bị hiện tại:
             f"chế độ tự động là {'bật' if device_status['auto_mode'] else 'tắt'}."
         )
 
+    reply_text = parsed.get("reply", "Mình đã nhận lệnh rồi nhé.")
+    parsed["audio_url"] = make_tts_wav(reply_text)
+
     latest_command = parsed
     return parsed
+
+@app.get("/")
+def root():
+    return {"ok": True, "message": "backend running"}
+
+@app.post("/ask")
+def ask_ai(data: UserInput):
+    return run_ai_from_text(data.text)
+
+@app.post("/voice")
+async def ask_voice(file: UploadFile = File(...)):
+    ext = Path(file.filename).suffix.lower() or ".wav"
+    upload_path = UPLOAD_DIR / f"{uuid.uuid4()}{ext}"
+
+    content = await file.read()
+    upload_path.write_bytes(content)
+
+    with open(upload_path, "rb") as audio_file:
+        transcript = client.audio.transcriptions.create(
+            model="gpt-4o-mini-transcribe",
+            file=audio_file,
+        )
+
+    heard_text = transcript.text
+    result = run_ai_from_text(heard_text)
+    result["heard_text"] = heard_text
+    return result
 
 @app.get("/device/pull")
 def device_pull():
     global latest_command
     cmd = latest_command.copy()
-    latest_command = {"command": None, "value": None, "reply": None}
+    latest_command = {
+        "command": None,
+        "value": None,
+        "reply": None,
+        "audio_url": None,
+    }
     return cmd
 
 @app.post("/device/report")
 def report_device(data: DeviceReport):
     global device_status
+
     if data.brightness is not None:
         device_status["brightness"] = data.brightness
     if data.auto_mode is not None:
@@ -108,6 +167,9 @@ def report_device(data: DeviceReport):
         device_status["ambient_lux"] = data.ambient_lux
     if data.distance_cm is not None:
         device_status["distance_cm"] = data.distance_cm
+    if data.mic_level is not None:
+        device_status["mic_level"] = data.mic_level
+
     device_status["online"] = True
     return {"ok": True}
 
