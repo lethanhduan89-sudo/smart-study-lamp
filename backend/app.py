@@ -11,8 +11,10 @@ app = FastAPI()
 client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 
 BASE_URL = os.environ.get("PUBLIC_BASE_URL", "https://smart-study-lamp.onrender.com")
+
 AUDIO_DIR = Path("audio_cache")
 UPLOAD_DIR = Path("uploads")
+
 AUDIO_DIR.mkdir(exist_ok=True)
 UPLOAD_DIR.mkdir(exist_ok=True)
 
@@ -34,8 +36,10 @@ device_status = {
     "online": False,
 }
 
+
 class UserInput(BaseModel):
     text: str
+
 
 class DeviceReport(BaseModel):
     brightness: int | None = None
@@ -43,6 +47,7 @@ class DeviceReport(BaseModel):
     ambient_lux: float | None = None
     distance_cm: float | None = None
     mic_level: float | None = None
+
 
 def make_tts_wav(text: str) -> str:
     file_id = str(uuid.uuid4())
@@ -58,11 +63,12 @@ def make_tts_wav(text: str) -> str:
 
     return f"{BASE_URL}/audio_cache/{file_id}.wav"
 
+
 def run_ai_from_text(user_text: str):
     global latest_command
 
     prompt = f"""
-Bạn là trợ lý điều khiển đèn học thông minh.
+Bạn là trợ lý điều khiển đèn học thông minh AI.
 Hãy trả về JSON hợp lệ duy nhất.
 
 Các command hợp lệ:
@@ -74,13 +80,23 @@ Các command hợp lệ:
 - auto_mode
 - manual_mode
 - status
+- introduce
 - none
 
 Quy tắc:
 - reply phải là tiếng Việt tự nhiên, thân thiện, ngắn gọn.
-- Nếu người dùng yêu cầu đặt độ sáng cụ thể, dùng set_brightness và value từ 0 đến 100.
-- Nếu không phải lệnh điều khiển, dùng command = none.
-- Nếu người dùng hỏi trạng thái, dùng command = status.
+- Nếu người dùng hỏi "đây là cái gì", "đây là sản phẩm gì", "bạn là ai", "giới thiệu về bạn", hãy dùng command = introduce.
+- Khi command = introduce, reply phải là: "Chào bạn, mình là sản phẩm đèn học thông minh AI. Mình có thể tự điều chỉnh ánh sáng, nhắc bạn ngồi đúng tư thế và hỗ trợ điều khiển bằng giọng nói."
+- Nếu người dùng yêu cầu bật đèn, dùng command = lamp_on.
+- Nếu người dùng yêu cầu tắt đèn, dùng command = lamp_off.
+- Nếu người dùng yêu cầu tăng sáng, dùng command = brighter.
+- Nếu người dùng yêu cầu giảm sáng, dùng command = dimmer.
+- Nếu người dùng yêu cầu đặt độ sáng cụ thể, dùng command = set_brightness và value từ 0 đến 100.
+- Nếu người dùng yêu cầu chế độ tự động, dùng command = auto_mode.
+- Nếu người dùng yêu cầu chế độ thủ công, dùng command = manual_mode.
+- Nếu người dùng hỏi trạng thái đèn, dùng command = status.
+- Nếu không phải lệnh điều khiển hoặc giới thiệu sản phẩm, dùng command = none.
+- Chỉ trả về JSON, không thêm giải thích ngoài JSON.
 
 Trạng thái thiết bị hiện tại:
 {json.dumps(device_status, ensure_ascii=False)}
@@ -110,19 +126,29 @@ Trạng thái thiết bị hiện tại:
             f"chế độ tự động là {'bật' if device_status['auto_mode'] else 'tắt'}."
         )
 
+    if parsed.get("command") == "introduce":
+        parsed["reply"] = (
+            "Chào bạn, mình là sản phẩm đèn học thông minh AI. "
+            "Mình có thể tự điều chỉnh ánh sáng, nhắc bạn ngồi đúng tư thế "
+            "và hỗ trợ điều khiển bằng giọng nói."
+        )
+
     reply_text = parsed.get("reply", "Mình đã nhận lệnh rồi nhé.")
     parsed["audio_url"] = make_tts_wav(reply_text)
 
     latest_command = parsed
     return parsed
 
+
 @app.get("/")
 def root():
     return {"ok": True, "message": "backend running"}
 
+
 @app.post("/ask")
 def ask_ai(data: UserInput):
     return run_ai_from_text(data.text)
+
 
 @app.post("/voice")
 async def ask_voice(file: UploadFile = File(...)):
@@ -143,17 +169,22 @@ async def ask_voice(file: UploadFile = File(...)):
     result["heard_text"] = heard_text
     return result
 
+
 @app.get("/device/pull")
 def device_pull():
     global latest_command
+
     cmd = latest_command.copy()
+
     latest_command = {
         "command": None,
         "value": None,
         "reply": None,
         "audio_url": None,
     }
+
     return cmd
+
 
 @app.post("/device/report")
 def report_device(data: DeviceReport):
@@ -172,6 +203,7 @@ def report_device(data: DeviceReport):
 
     device_status["online"] = True
     return {"ok": True}
+
 
 @app.get("/device/status")
 def get_status():
