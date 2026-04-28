@@ -1,0 +1,13 @@
+.env
+backend/.env
+
+esp32/secrets.h
+
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+*.bin
+*.elf
+*.map
