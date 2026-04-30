@@ -6,21 +6,28 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from openai import OpenAI
 from pydantic import BaseModel
 
+
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 STT_MODEL = os.getenv("STT_MODEL", "gpt-4o-mini-transcribe")
+TTS_MODEL = os.getenv("TTS_MODEL", "gpt-4o-mini-tts")
+TTS_VOICE = os.getenv("TTS_VOICE", "alloy")
 
 client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 BASE_DIR = Path(__file__).resolve().parent
 UPLOAD_DIR = BASE_DIR / "uploads"
-UPLOAD_DIR.mkdir(exist_ok=True)
+AUDIO_DIR = BASE_DIR / "audio_cache"
 
-app = FastAPI(title="Smart Study Lamp Backend")
+UPLOAD_DIR.mkdir(exist_ok=True)
+AUDIO_DIR.mkdir(exist_ok=True)
+
+app = FastAPI(title="Smart Study Lamp Backend Audio Version")
 
 app.add_middleware(
     CORSMiddleware,
@@ -29,6 +36,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 device_status: Dict[str, Any] = {
     "power": False,
@@ -48,6 +56,7 @@ pending_command: Dict[str, Any] = {
     "command": "none",
     "value": -1,
     "reply": "",
+    "audio_url": None,
 }
 
 
@@ -79,7 +88,9 @@ def compute_public_status() -> Dict[str, Any]:
             dt = datetime.fromisoformat(last_seen)
             if dt.tzinfo is None:
                 dt = dt.replace(tzinfo=timezone.utc)
+
             age_s = (datetime.now(timezone.utc) - dt).total_seconds()
+
             if age_s > 15:
                 s["online"] = False
         except Exception:
@@ -113,13 +124,14 @@ def status_reply() -> str:
 def parse_text_command(text: str) -> Dict[str, Any]:
     t = normalize_text(text)
 
-    if any(x in t for x in ["gioi thieu", "ban la ai", "san pham gi", "day la gi"]):
+    if any(x in t for x in ["gioi thieu", "ban la ai", "san pham gi", "day la gi", "day la cai gi"]):
         return {
             "command": "introduce",
             "value": -1,
             "reply": (
                 "Mình là đèn học thông minh AI. "
-                "Mình tự chỉnh sáng, phát hiện sai tư thế và hỗ trợ điều khiển bằng giọng nói."
+                "Mình có thể tự chỉnh ánh sáng, phát hiện sai tư thế "
+                "và hỗ trợ điều khiển bằng giọng nói."
             ),
         }
 
@@ -133,6 +145,7 @@ def parse_text_command(text: str) -> Dict[str, Any]:
     match_percent = re.search(r"(\d{1,3})\s*(%|phan tram)", t)
     if match_percent:
         value = clamp(int(match_percent.group(1)), 0, 100)
+
         return {
             "command": "set_brightness",
             "value": value,
@@ -181,16 +194,47 @@ def parse_text_command(text: str) -> Dict[str, Any]:
             "reply": "Đã chuyển sang chế độ thủ công.",
         }
 
-    return {
-        "command": "none",
-        "value": -1,
-        "reply": "Mình chưa hiểu rõ lệnh này.",
-    }
+    if client is None:
+        return {
+            "command": "none",
+            "value": -1,
+            "reply": "Mình chưa hiểu rõ lệnh này.",
+        }
+
+    try:
+        response = client.responses.create(
+            model="gpt-4o-mini",
+            input=(
+                "Bạn là trợ lý của đèn học thông minh AI. "
+                "Nếu người dùng hỏi kiến thức chung, hãy trả lời ngắn gọn bằng tiếng Việt. "
+                "Nếu không phải lệnh điều khiển đèn, command là none.\n\n"
+                f"Người dùng hỏi: {text}"
+            ),
+        )
+
+        reply = response.output_text.strip()
+
+        if not reply:
+            reply = "Mình chưa có câu trả lời phù hợp."
+
+        return {
+            "command": "none",
+            "value": -1,
+            "reply": reply,
+        }
+
+    except Exception:
+        return {
+            "command": "none",
+            "value": -1,
+            "reply": "Mình chưa hiểu rõ lệnh này.",
+        }
 
 
 def apply_shadow_command(command: str, value: int) -> None:
     if command == "lamp_on":
         device_status["power"] = True
+
         if int(device_status.get("brightness", 0)) == 0:
             device_status["brightness"] = 50
 
@@ -201,12 +245,21 @@ def apply_shadow_command(command: str, value: int) -> None:
         device_status["power"] = True
         device_status["auto_mode"] = False
         device_status["mode"] = "manual"
-        device_status["brightness"] = clamp(int(device_status.get("brightness", 0)) + 10, 0, 100)
+        device_status["brightness"] = clamp(
+            int(device_status.get("brightness", 0)) + 10,
+            0,
+            100,
+        )
 
     elif command == "dimmer":
         device_status["auto_mode"] = False
         device_status["mode"] = "manual"
-        device_status["brightness"] = clamp(int(device_status.get("brightness", 0)) - 10, 0, 100)
+        device_status["brightness"] = clamp(
+            int(device_status.get("brightness", 0)) - 10,
+            0,
+            100,
+        )
+
         if int(device_status["brightness"]) == 0:
             device_status["power"] = False
 
@@ -228,22 +281,60 @@ def apply_shadow_command(command: str, value: int) -> None:
         device_status["mode"] = "manual"
 
 
-def queue_command(command: str, value: int, reply: str) -> None:
+def make_audio_url(filename: str, request: Request) -> str:
+    base_url = str(request.base_url).rstrip("/")
+    return f"{base_url}/audio/{filename}"
+
+
+def make_tts_audio(reply: str, request: Request) -> str | None:
+    if client is None:
+        return None
+
+    if not reply:
+        return None
+
+    try:
+        filename = f"{uuid.uuid4().hex}.mp3"
+        output_path = AUDIO_DIR / filename
+
+        speech = client.audio.speech.create(
+            model=TTS_MODEL,
+            voice=TTS_VOICE,
+            input=reply,
+            response_format="mp3",
+        )
+
+        output_path.write_bytes(speech.content)
+
+        return make_audio_url(filename, request)
+
+    except Exception:
+        return None
+
+
+def queue_command(command: str, value: int, reply: str, audio_url: str | None) -> None:
     global pending_command
 
     pending_command = {
         "command": command,
         "value": value,
         "reply": reply,
+        "audio_url": audio_url,
     }
 
     apply_shadow_command(command, value)
 
 
-def handle_text(text: str) -> Dict[str, Any]:
+def handle_text(text: str, request: Request) -> Dict[str, Any]:
     result = parse_text_command(text)
 
-    if result["command"] in {
+    command = result["command"]
+    value = int(result["value"])
+    reply = result["reply"]
+
+    audio_url = make_tts_audio(reply, request)
+
+    if command in {
         "lamp_on",
         "lamp_off",
         "brighter",
@@ -252,28 +343,34 @@ def handle_text(text: str) -> Dict[str, Any]:
         "auto_mode",
         "manual_mode",
     }:
-        queue_command(result["command"], int(result["value"]), result["reply"])
+        queue_command(command, value, reply, audio_url)
 
-    result["status"] = compute_public_status()
-    return result
+    return {
+        "heard_text": text,
+        "command": command,
+        "value": value,
+        "reply": reply,
+        "audio_url": audio_url,
+        "status": compute_public_status(),
+    }
 
 
 @app.get("/")
 def root():
     return {
         "ok": True,
-        "service": "smart-study-lamp-backend",
+        "service": "smart-study-lamp-backend-audio",
         "status": compute_public_status(),
     }
 
 
 @app.post("/ask")
-def ask(body: AskBody):
-    return handle_text(body.text)
+def ask(body: AskBody, request: Request):
+    return handle_text(body.text, request)
 
 
 @app.post("/voice")
-async def voice(file: UploadFile = File(...)):
+async def voice(request: Request, file: UploadFile = File(...)):
     if client is None:
         raise HTTPException(
             status_code=503,
@@ -296,23 +393,35 @@ async def voice(file: UploadFile = File(...)):
         heard_text = getattr(transcript, "text", "").strip()
 
         if not heard_text:
+            reply = "Mình chưa nghe rõ."
+            audio_url = make_tts_audio(reply, request)
+
             return {
                 "heard_text": "",
                 "command": "none",
                 "value": -1,
-                "reply": "Mình chưa nghe rõ.",
+                "reply": reply,
+                "audio_url": audio_url,
                 "status": compute_public_status(),
             }
 
-        result = handle_text(heard_text)
-        result["heard_text"] = heard_text
-        return result
+        return handle_text(heard_text, request)
 
     finally:
         try:
             temp_path.unlink(missing_ok=True)
         except Exception:
             pass
+
+
+@app.get("/audio/{filename}")
+def get_audio(filename: str):
+    path = AUDIO_DIR / filename
+
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Audio not found")
+
+    return FileResponse(path)
 
 
 @app.get("/device/status")
@@ -330,6 +439,7 @@ def device_pull():
         "command": "none",
         "value": -1,
         "reply": "",
+        "audio_url": None,
     }
 
     return cmd
