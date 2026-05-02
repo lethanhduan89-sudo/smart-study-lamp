@@ -27,7 +27,7 @@ AUDIO_DIR = BASE_DIR / "audio_cache"
 UPLOAD_DIR.mkdir(exist_ok=True)
 AUDIO_DIR.mkdir(exist_ok=True)
 
-app = FastAPI(title="Smart Study Lamp Backend Audio Version")
+app = FastAPI(title="Smart Study Lamp Backend WAV Audio")
 
 app.add_middleware(
     CORSMiddleware,
@@ -143,6 +143,7 @@ def parse_text_command(text: str) -> Dict[str, Any]:
         }
 
     match_percent = re.search(r"(\d{1,3})\s*(%|phan tram)", t)
+
     if match_percent:
         value = clamp(int(match_percent.group(1)), 0, 100)
 
@@ -206,16 +207,12 @@ def parse_text_command(text: str) -> Dict[str, Any]:
             model="gpt-4o-mini",
             input=(
                 "Bạn là trợ lý của đèn học thông minh AI. "
-                "Nếu người dùng hỏi kiến thức chung, hãy trả lời ngắn gọn bằng tiếng Việt. "
-                "Nếu không phải lệnh điều khiển đèn, command là none.\n\n"
-                f"Người dùng hỏi: {text}"
+                "Trả lời ngắn gọn bằng tiếng Việt, phù hợp học sinh. "
+                f"Câu hỏi: {text}"
             ),
         )
 
-        reply = response.output_text.strip()
-
-        if not reply:
-            reply = "Mình chưa có câu trả lời phù hợp."
+        reply = response.output_text.strip() or "Mình chưa có câu trả lời phù hợp."
 
         return {
             "command": "none",
@@ -245,20 +242,12 @@ def apply_shadow_command(command: str, value: int) -> None:
         device_status["power"] = True
         device_status["auto_mode"] = False
         device_status["mode"] = "manual"
-        device_status["brightness"] = clamp(
-            int(device_status.get("brightness", 0)) + 10,
-            0,
-            100,
-        )
+        device_status["brightness"] = clamp(int(device_status.get("brightness", 0)) + 10, 0, 100)
 
     elif command == "dimmer":
         device_status["auto_mode"] = False
         device_status["mode"] = "manual"
-        device_status["brightness"] = clamp(
-            int(device_status.get("brightness", 0)) - 10,
-            0,
-            100,
-        )
+        device_status["brightness"] = clamp(int(device_status.get("brightness", 0)) - 10, 0, 100)
 
         if int(device_status["brightness"]) == 0:
             device_status["power"] = False
@@ -287,21 +276,18 @@ def make_audio_url(filename: str, request: Request) -> str:
 
 
 def make_tts_audio(reply: str, request: Request) -> str | None:
-    if client is None:
-        return None
-
-    if not reply:
+    if client is None or not reply:
         return None
 
     try:
-        filename = f"{uuid.uuid4().hex}.mp3"
+        filename = f"{uuid.uuid4().hex}.wav"
         output_path = AUDIO_DIR / filename
 
         speech = client.audio.speech.create(
             model=TTS_MODEL,
             voice=TTS_VOICE,
             input=reply,
-            response_format="mp3",
+            response_format="wav",
         )
 
         output_path.write_bytes(speech.content)
@@ -359,7 +345,7 @@ def handle_text(text: str, request: Request) -> Dict[str, Any]:
 def root():
     return {
         "ok": True,
-        "service": "smart-study-lamp-backend-audio",
+        "service": "smart-study-lamp-backend-wav",
         "status": compute_public_status(),
     }
 
@@ -421,7 +407,7 @@ def get_audio(filename: str):
     if not path.exists():
         raise HTTPException(status_code=404, detail="Audio not found")
 
-    return FileResponse(path)
+    return FileResponse(path, media_type="audio/wav")
 
 
 @app.get("/device/status")
