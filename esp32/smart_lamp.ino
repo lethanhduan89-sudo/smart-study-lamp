@@ -69,6 +69,7 @@ constexpr uint32_t ABSENT_CONFIRM_MS = 10000;
 
 constexpr int MIC_SAMPLE_RATE = 8000;
 constexpr int RECORD_SECONDS = 2;
+constexpr int MIC_BITS = 16;
 constexpr int MIC_SAMPLES = MIC_SAMPLE_RATE * RECORD_SECONDS;
 
 constexpr i2s_port_t I2S_MIC_PORT = I2S_NUM_0;
@@ -103,10 +104,6 @@ uint32_t postureBadSinceMs = 0;
 uint32_t lastPostureAlertMs = 0;
 bool noPersonAlertSent = false;
 
-volatile uint32_t echoRiseUs = 0;
-volatile uint32_t echoPulseUs = 0;
-volatile bool echoReady = false;
-
 // ================= TIMER =================
 
 struct Timer {
@@ -124,8 +121,7 @@ struct Timer {
 };
 
 Timer tWifi{0, 3000};
-Timer tTrig{0, 80};
-Timer tEcho{0, 20};
+Timer tDistance{0, 300};
 Timer tLux{0, 1000};
 Timer tLogic{0, 300};
 Timer tReport{0, 5000};
@@ -164,6 +160,25 @@ uint32_t le32(const uint8_t* p) {
          ((uint32_t)p[3] << 24);
 }
 
+bool readExact(Stream* s, uint8_t* buf, size_t len, uint32_t timeoutMs = 10000) {
+  size_t got = 0;
+  uint32_t start = millis();
+
+  while (got < len) {
+    if (s->available()) {
+      got += s->readBytes(buf + got, len - got);
+      start = millis();
+    } else {
+      if (millis() - start > timeoutMs) return false;
+      delay(1);
+      server.handleClient();
+      yield();
+    }
+  }
+
+  return true;
+}
+
 // ================= LAMP =================
 
 void pwmBegin() {
@@ -184,7 +199,6 @@ void setLamp(bool on) {
 
 void setBrightness(uint8_t value) {
   brightness = constrain(value, 0, 100);
-  if (brightness > 0) lampPower = true;
   pwmWritePercent(brightness);
 }
 
@@ -230,6 +244,7 @@ void speakerBegin() {
   cfg.tx_desc_auto_clear = true;
 
   i2s_pin_config_t pins = {};
+  pins.mck_io_num = I2S_PIN_NO_CHANGE;
   pins.bck_io_num = PIN_SPK_BCLK;
   pins.ws_io_num = PIN_SPK_LRC;
   pins.data_out_num = PIN_SPK_DIN;
@@ -242,6 +257,63 @@ void speakerBegin() {
   Serial.println("MAX98357A ready");
 }
 
+bool playWavData(Stream* stream, uint32_t dataSize, uint16_t channels) {
+  uint8_t buffer[1024];
+  uint32_t remain = dataSize;
+  uint16_t frameSize = channels * 2;
+
+  while (remain > 0) {
+    int avail = stream->available();
+
+    if (avail <= 0) {
+      delay(1);
+      server.handleClient();
+      yield();
+      continue;
+    }
+
+    uint32_t toRead = sizeof(buffer);
+    if (toRead > remain) toRead = remain;
+    if ((uint32_t)avail < toRead) toRead = avail;
+
+    toRead -= toRead % frameSize;
+    if (toRead == 0) {
+      delay(1);
+      continue;
+    }
+
+    int n = stream->readBytes(buffer, toRead);
+    if (n <= 0) break;
+
+    if (channels == 1) {
+      size_t written = 0;
+      i2s_write(I2S_SPK_PORT, buffer, n, &written, portMAX_DELAY);
+    } else {
+      int16_t* stereo = (int16_t*)buffer;
+      int samples = n / 4;
+      int16_t mono[256];
+
+      if (samples > 256) samples = 256;
+
+      for (int i = 0; i < samples; i++) {
+        int16_t left = stereo[i * 2];
+        int16_t right = stereo[i * 2 + 1];
+        mono[i] = (int16_t)(((int32_t)left + right) / 2);
+      }
+
+      size_t written = 0;
+      i2s_write(I2S_SPK_PORT, mono, samples * sizeof(int16_t), &written, portMAX_DELAY);
+    }
+
+    remain -= n;
+    server.handleClient();
+    yield();
+  }
+
+  i2s_zero_dma_buffer(I2S_SPK_PORT);
+  return true;
+}
+
 bool playWavUrl(const String& url) {
   if (url.length() == 0 || WiFi.status() != WL_CONNECTED) return false;
 
@@ -252,7 +324,10 @@ bool playWavUrl(const String& url) {
   c.setInsecure();
 
   HTTPClient http;
-  if (!http.begin(c, url)) return false;
+  if (!http.begin(c, url)) {
+    Serial.println("WAV http begin failed");
+    return false;
+  }
 
   http.setTimeout(30000);
   int code = http.GET();
@@ -266,72 +341,98 @@ bool playWavUrl(const String& url) {
 
   WiFiClient* stream = http.getStreamPtr();
 
-  uint8_t header[44];
-  if (stream->readBytes(header, 44) != 44) {
+  uint8_t riff[12];
+  if (!readExact(stream, riff, 12)) {
+    Serial.println("WAV RIFF read failed");
     http.end();
     return false;
   }
 
-  if (memcmp(header, "RIFF", 4) != 0 || memcmp(header + 8, "WAVE", 4) != 0) {
-    Serial.println("Invalid WAV");
+  if (memcmp(riff, "RIFF", 4) != 0 || memcmp(riff + 8, "WAVE", 4) != 0) {
+    Serial.println("Invalid WAV RIFF");
     http.end();
     return false;
   }
 
-  uint16_t channels = le16(header + 22);
-  uint32_t sampleRate = le32(header + 24);
-  uint16_t bits = le16(header + 34);
-  uint32_t dataSize = le32(header + 40);
+  uint16_t channels = 1;
+  uint32_t sampleRate = 24000;
+  uint16_t bits = 16;
+  bool fmtFound = false;
+  bool dataPlayed = false;
 
-  if (bits != 16) {
-    Serial.println("Only 16-bit WAV supported");
-    http.end();
-    return false;
-  }
+  while (http.connected()) {
+    uint8_t chunkHeader[8];
+    if (!readExact(stream, chunkHeader, 8, 5000)) break;
 
-  i2s_set_clk(I2S_SPK_PORT, sampleRate, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_MONO);
+    char chunkId[5] = {0};
+    memcpy(chunkId, chunkHeader, 4);
+    uint32_t chunkSize = le32(chunkHeader + 4);
 
-  uint8_t buffer[1024];
-  uint32_t remain = dataSize;
+    if (memcmp(chunkHeader, "fmt ", 4) == 0) {
+      uint8_t fmt[32];
+      uint32_t toRead = chunkSize > sizeof(fmt) ? sizeof(fmt) : chunkSize;
 
-  while (http.connected() && remain > 0) {
-    int avail = stream->available();
+      if (!readExact(stream, fmt, toRead)) break;
 
-    if (avail <= 0) {
-      delay(1);
-      server.handleClient();
-      continue;
-    }
-
-    int n = stream->readBytes(buffer, min((int)sizeof(buffer), min(avail, (int)remain)));
-    if (n <= 0) break;
-
-    if (channels == 1) {
-      size_t written = 0;
-      i2s_write(I2S_SPK_PORT, buffer, n, &written, portMAX_DELAY);
-    } else {
-      int16_t* stereo = (int16_t*)buffer;
-      int samples = n / 4;
-      int16_t mono[256];
-      if (samples > 256) samples = 256;
-
-      for (int i = 0; i < samples; i++) {
-        mono[i] = (int16_t)(((int32_t)stereo[i * 2] + stereo[i * 2 + 1]) / 2);
+      if (chunkSize > toRead) {
+        uint8_t dump[64];
+        uint32_t left = chunkSize - toRead;
+        while (left > 0) {
+          uint32_t n = left > sizeof(dump) ? sizeof(dump) : left;
+          if (!readExact(stream, dump, n)) break;
+          left -= n;
+        }
       }
 
-      size_t written = 0;
-      i2s_write(I2S_SPK_PORT, mono, samples * sizeof(int16_t), &written, portMAX_DELAY);
-    }
+      channels = le16(fmt + 2);
+      sampleRate = le32(fmt + 4);
+      bits = le16(fmt + 14);
+      fmtFound = true;
 
-    remain -= n;
-    server.handleClient();
-    yield();
+      Serial.print("WAV fmt rate=");
+      Serial.print(sampleRate);
+      Serial.print(" channels=");
+      Serial.print(channels);
+      Serial.print(" bits=");
+      Serial.println(bits);
+
+      if (bits != 16) {
+        Serial.println("Only 16-bit WAV supported");
+        http.end();
+        return false;
+      }
+
+      i2s_set_clk(I2S_SPK_PORT, sampleRate, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_MONO);
+    }
+    else if (memcmp(chunkHeader, "data", 4) == 0) {
+      if (!fmtFound) {
+        Serial.println("WAV data before fmt");
+      }
+
+      Serial.print("WAV data size=");
+      Serial.println(chunkSize);
+
+      dataPlayed = playWavData(stream, chunkSize, channels);
+      break;
+    }
+    else {
+      uint8_t dump[64];
+      uint32_t left = chunkSize;
+
+      while (left > 0) {
+        uint32_t n = left > sizeof(dump) ? sizeof(dump) : left;
+        if (!readExact(stream, dump, n)) break;
+        left -= n;
+      }
+    }
   }
 
-  i2s_zero_dma_buffer(I2S_SPK_PORT);
   http.end();
-  Serial.println("WAV finished");
-  return true;
+
+  if (dataPlayed) Serial.println("WAV finished");
+  else Serial.println("WAV not played");
+
+  return dataPlayed;
 }
 
 // ================= I2S MIC =================
@@ -346,8 +447,10 @@ void micBegin() {
   cfg.intr_alloc_flags = ESP_INTR_FLAG_LEVEL1;
   cfg.dma_buf_count = 8;
   cfg.dma_buf_len = 256;
+  cfg.use_apll = false;
 
   i2s_pin_config_t pins = {};
+  pins.mck_io_num = I2S_PIN_NO_CHANGE;
   pins.bck_io_num = PIN_MIC_SCK;
   pins.ws_io_num = PIN_MIC_WS;
   pins.data_out_num = I2S_PIN_NO_CHANGE;
@@ -468,10 +571,14 @@ bool httpGetJson(const String& path, JsonDocument& doc) {
 }
 
 bool uploadVoice() {
-  if (WiFi.status() != WL_CONNECTED) return false;
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi not connected");
+    return false;
+  }
 
   size_t wavSize = 0;
   uint8_t* wav = recordWav(wavSize);
+
   if (!wav) {
     Serial.println("Record malloc failed");
     return false;
@@ -512,6 +619,7 @@ bool uploadVoice() {
 
   if (!http.begin(c, url)) {
     free(body);
+    Serial.println("HTTP begin failed");
     return false;
   }
 
@@ -531,7 +639,10 @@ bool uploadVoice() {
   if (code < 200 || code >= 300) return false;
 
   StaticJsonDocument<2048> doc;
-  if (deserializeJson(doc, response)) return false;
+  if (deserializeJson(doc, response)) {
+    Serial.println("Voice JSON parse failed");
+    return false;
+  }
 
   String command = doc["command"] | "none";
   int value = doc["value"] | -1;
@@ -542,20 +653,23 @@ bool uploadVoice() {
   Serial.println((const char*)doc["heard_text"]);
   Serial.print("Reply: ");
   Serial.println(reply);
+  Serial.print("Audio: ");
+  Serial.println(audioUrl);
 
   if (command == "lamp_on") {
-    brightness = brightness == 0 ? 100 : brightness;
+    if (brightness == 0) brightness = 100;
     setLamp(true);
   } else if (command == "lamp_off") {
     setLamp(false);
   } else if (command == "set_brightness") {
-    setBrightness(value);
+    brightness = constrain(value, 0, 100);
     setLamp(value > 0);
+    pwmWritePercent(brightness);
   } else if (command == "brighter") {
-    setBrightness(min(100, brightness + 10));
+    brightness = min(100, brightness + 10);
     setLamp(true);
   } else if (command == "dimmer") {
-    setBrightness(brightness > 10 ? brightness - 10 : 0);
+    brightness = brightness > 10 ? brightness - 10 : 0;
     setLamp(brightness > 0);
   }
 
@@ -565,6 +679,8 @@ bool uploadVoice() {
 }
 
 void sendAlert(const String& type) {
+  if (WiFi.status() != WL_CONNECTED) return;
+
   StaticJsonDocument<128> req;
   req["type"] = type;
 
@@ -575,6 +691,7 @@ void sendAlert(const String& type) {
   if (deserializeJson(doc, res)) return;
 
   String audioUrl = doc["audio_url"] | "";
+
   if (audioUrl.length() > 0) playWavUrl(audioUrl);
 }
 
@@ -650,12 +767,17 @@ void setupPortal() {
 
   server.on("/voice", HTTP_GET, []() {
     bool ok = uploadVoice();
-    server.send(ok ? 200 : 500, "text/html; charset=utf-8", ok ? "<h2>OK</h2><a href='/'>Quay lai</a>" : "<h2>Loi voice</h2><a href='/'>Quay lai</a>");
+    server.send(
+      ok ? 200 : 500,
+      "text/html; charset=utf-8",
+      ok ? "<h2>OK</h2><a href='/'>Quay lai</a>" : "<h2>Loi voice</h2><a href='/'>Quay lai</a>"
+    );
   });
 }
 
 void startAp() {
   apSsid = makeApSsid();
+
   WiFi.mode(WIFI_AP_STA);
   WiFi.softAPConfig(IPAddress(192,168,4,1), IPAddress(192,168,4,1), IPAddress(255,255,255,0));
   WiFi.softAP(apSsid.c_str(), CONFIG_AP_PASS);
@@ -687,42 +809,18 @@ void maintainWifi() {
 
 // ================= HCSR04 =================
 
-void IRAM_ATTR onEcho() {
-  uint32_t now = micros();
-
-  if (digitalRead(PIN_ECHO)) {
-    echoRiseUs = now;
-  } else {
-    echoPulseUs = now - echoRiseUs;
-    echoReady = true;
-  }
-}
-
-void triggerPing() {
+void updateDistance() {
   digitalWrite(PIN_TRIG, LOW);
   delayMicroseconds(2);
   digitalWrite(PIN_TRIG, HIGH);
   delayMicroseconds(10);
   digitalWrite(PIN_TRIG, LOW);
-}
 
-void updateDistance() {
-  bool ready = false;
-  uint32_t pulse = 0;
+  uint32_t duration = pulseIn(PIN_ECHO, HIGH, 25000);
 
-  noInterrupts();
-  if (echoReady) {
-    ready = true;
-    pulse = echoPulseUs;
-    echoReady = false;
+  if (duration > 0) {
+    distanceCm = duration / 58.0;
   }
-  interrupts();
-
-  if (!ready) return;
-
-  if (pulse < 100 || pulse > 30000) return;
-
-  distanceCm = pulse / 58.0;
 }
 
 // ================= LOGIC =================
@@ -774,10 +872,18 @@ void readLux() {
 
 void reportStatus() {
   StaticJsonDocument<384> doc;
+
   doc["power"] = lampPower;
   doc["brightness"] = brightness;
-  doc["ambient_lux"] = isnan(lux) ? nullptr : lux;
-  doc["distance_cm"] = isnan(distanceCm) ? nullptr : distanceCm;
+
+  if (!isnan(lux)) {
+    doc["ambient_lux"] = lux;
+  }
+
+  if (!isnan(distanceCm)) {
+    doc["distance_cm"] = distanceCm;
+  }
+
   doc["present"] = present;
   doc["posture_bad"] = postureBad;
 
@@ -797,13 +903,14 @@ void pollCommand() {
   } else if (command == "lamp_off") {
     setLamp(false);
   } else if (command == "set_brightness") {
-    setBrightness(value);
+    brightness = constrain(value, 0, 100);
     setLamp(value > 0);
+    pwmWritePercent(brightness);
   } else if (command == "brighter") {
-    setBrightness(min(100, brightness + 10));
+    brightness = min(100, brightness + 10);
     setLamp(true);
   } else if (command == "dimmer") {
-    setBrightness(brightness > 10 ? brightness - 10 : 0);
+    brightness = brightness > 10 ? brightness - 10 : 0;
     setLamp(brightness > 0);
   }
 
@@ -812,6 +919,7 @@ void pollCommand() {
 
 void debugPrint() {
   Serial.print("STA=");
+
   if (WiFi.status() == WL_CONNECTED) {
     Serial.print(WiFi.SSID());
     Serial.print("@");
@@ -848,7 +956,11 @@ void serialCmd() {
       if (line == "voice") uploadVoice();
       else if (line == "on") setLamp(true);
       else if (line == "off") setLamp(false);
-      else if (line.startsWith("b")) setBrightness(line.substring(1).toInt());
+      else if (line.startsWith("b")) {
+        brightness = constrain(line.substring(1).toInt(), 0, 100);
+        setLamp(brightness > 0);
+        pwmWritePercent(brightness);
+      }
 
       line = "";
     } else {
@@ -867,12 +979,11 @@ void setup() {
 
   pinMode(PIN_PWM_LED, OUTPUT);
   pwmBegin();
-  setBrightness(100);
+  brightness = 100;
   setLamp(false);
 
   pinMode(PIN_TRIG, OUTPUT);
   pinMode(PIN_ECHO, INPUT);
-  attachInterrupt(digitalPinToInterrupt(PIN_ECHO), onEcho, CHANGE);
 
   Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
   delay(200);
@@ -899,7 +1010,7 @@ void setup() {
 
   server.begin();
 
-  Serial.println("Smart Study Lamp ESP32-S3 CLEAN started");
+  Serial.println("Smart Study Lamp ESP32-S3 VOICE started");
   Serial.println("Commands: voice | on | off | b50");
 }
 
@@ -907,8 +1018,7 @@ void loop() {
   server.handleClient();
 
   if (tWifi.due()) maintainWifi();
-  if (tTrig.due()) triggerPing();
-  if (tEcho.due()) updateDistance();
+  if (tDistance.due()) updateDistance();
   if (tLux.due()) readLux();
   if (tLogic.due()) logicControl();
   if (tReport.due()) reportStatus();
